@@ -2,8 +2,10 @@ import mailbox
 import csv
 import json
 import re
+import time
+import requests
 from openai import OpenAI
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import argparse
 
 def get_api_key() -> str:
@@ -16,10 +18,41 @@ def get_api_key() -> str:
    except Exception as e:
        raise Exception(f"error reading api key: {e}")
 
+def geocode_address(address: str) -> Optional[str]:
+    """Convert address to latitude,longitude using Nominatim API."""
+    if not address:
+        return None
+        
+    base_url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": address,
+        "format": "json",
+        "limit": 1
+    }
+    headers = {
+        "User-Agent": "EnvReportParser/1.0"  # required by nominatim ToS 😮‍💨
+    }
+    
+    try:
+        # rate limit but do we care? I could totally get rid of this cos
+        # the llm is gonna take a while too
+        time.sleep(1)
+        response = requests.get(base_url, params=params, headers=headers)
+        response.raise_for_status()
+        
+        results = response.json()
+        if results and len(results) > 0:
+            lat = results[0]["lat"]
+            lon = results[0]["lon"]
+            return f"({lat}, {lon})"
+        return None
+    except Exception as e:
+        print(f"Geocoding error for address '{address}': {e}")
+        return None
+
 def clean_text(text: str) -> str:
    """Remove email headers, signatures, formatting artifacts, etc. etc."""
    lines = []
-   # TODO: add to this list of skip patterns
    skip_patterns = [
        r'^-+ Forwarded message -+$',
        r'^From:',
@@ -123,19 +156,23 @@ def process_mbox(mbox_path: str, output_csv: str, unclassified_txt: str, email_l
        clean = clean_text(text)
        parsed_records, unclassified_text = parse_block(client, clean)
        
+       # geocoding lol
+       for record in parsed_records:
+           record["latlong"] = geocode_address(record["address"])
+       
        records.extend(parsed_records)
        unclassified.extend(unclassified_text)
        
        print(f"Processed email {i+1}/{min(email_limit, len(mbox))}")
    
    with open(output_csv, 'w', newline='', encoding='utf-8') as f:
-       writer = csv.DictWriter(f, fieldnames=['name', 'address', 'type', 'date', 'description'])
+       writer = csv.DictWriter(f, fieldnames=['name', 'address', 'type', 'date', 'description', 'latlong'])
        writer.writeheader()
-       writer.writerows(records) # ok now we write to csv
+       writer.writerows(records)
    
    with open(unclassified_txt, 'w', encoding='utf-8') as f:
        for text in unclassified:
-           f.write(text + '\n\n' + '-'*80 + '\n\n') # junk text lol
+           f.write(text + '\n\n' + '-'*80 + '\n\n')
 
 if __name__ == '__main__':
    parser = argparse.ArgumentParser(description='Process environmental report emails.')
