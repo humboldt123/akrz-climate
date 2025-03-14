@@ -1,22 +1,16 @@
+#!/usr/bin/env python3
 import mailbox
 import csv
 import json
 import re
 import time
 import requests
-from openai import OpenAI
-from typing import Dict, List, Tuple, Optional
+import os
 import argparse
+from typing import Dict, List, Tuple, Optional
 
-def get_api_key() -> str:
-   """Read OpenAI API key from secret file."""
-   try:
-       with open('secret', 'r') as f:
-           return f.read().strip()
-   except FileNotFoundError:
-       raise Exception("'secret' file not found in current directory :(")
-   except Exception as e:
-       raise Exception(f"error reading api key: {e}")
+# set environment variables for hf cache
+os.environ["HF_HOME"] = "/local-ssd/hf_cache/"
 
 def geocode_address(address: str) -> Optional[str]:
     """Convert address to latitude,longitude using Nominatim API."""
@@ -30,7 +24,7 @@ def geocode_address(address: str) -> Optional[str]:
         "limit": 1
     }
     headers = {
-        "User-Agent": "EnvReportParser/1.0"  # required by nominatim ToS 😮‍💨
+        "User-Agent": "EnvReportParser/1.0"  # required by nominatim ToS
     }
     
     try:
@@ -51,45 +45,76 @@ def geocode_address(address: str) -> Optional[str]:
         return None
 
 def clean_text(text: str) -> str:
-   """Remove email headers, signatures, formatting artifacts, etc. etc."""
-   lines = []
-   skip_patterns = [
-       r'^-+ Forwarded message -+$',
-       r'^From:',
-       r'^Date:',
-       r'^Subject:',
-       r'^To:',
-       r'^Contact:',
-       r'^Thanks',
-       r'@',
-       r'advocate',
-       r'cleanair\.org',
-       r'Southeast Region:',
-       r'^\s*>+'
-   ]
-   
-   for line in text.split('\n'):
-       if not any(re.search(pattern, line, re.I) for pattern in skip_patterns):
-           lines.append(line)
-           
-   return '\n'.join(lines)
+    """Remove email headers, signatures, formatting artifacts, etc. etc."""
+    lines = []
+    skip_patterns = [
+        r'^-+ Forwarded message -+$',
+        r'^From:',
+        r'^Date:',
+        r'^Subject:',
+        r'^To:',
+        r'^Contact:',
+        r'^Thanks',
+        r'@',
+        r'advocate',
+        r'cleanair\.org',
+        r'Southeast Region:',
+        r'^\s*>+'
+    ]
+    
+    for line in text.split('\n'):
+        if not any(re.search(pattern, line, re.I) for pattern in skip_patterns):
+            lines.append(line)
+            
+    return '\n'.join(lines)
 
 def extract_date(text: str) -> str:
-   """Extract date from text using regex."""
-   date_patterns = [
-       r'(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}',
-       r'\d{1,2}/\d{1,2}/\d{4}'
-   ]
-   
-   for pattern in date_patterns:
-       match = re.search(pattern, text)
-       if match:
-           return match.group(0)
-   return ""
+    """Extract date from text using regex."""
+    date_patterns = [
+        r'(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}',
+        r'\d{1,2}/\d{1,2}/\d{4}'
+    ]
+    
+    for pattern in date_patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(0)
+    return ""
 
-def parse_block(client: OpenAI, text: str) -> Tuple[List[Dict], List[str]]:
-   """Parse text via OpenAI."""
-   prompt = f"""Parse this environmental report text into structured data. Extract:
+def init_llama_model():
+    """Initialize Llama 3.1 70B model using HuggingFace Transformers."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+    import torch
+    
+    model_id = "meta-llama/Llama-3.1-70B-Instruct"
+    
+    print(f"Loading tokenizer from {model_id}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    
+    print(f"Loading model from {model_id}...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True
+    )
+    
+    print("Creating text generation pipeline...")
+    llm = pipeline(
+        "text-generation",
+        model=model,
+        tokenizer=tokenizer,
+        max_new_tokens=4096,
+        do_sample=False
+    )
+    
+    return llm
+
+def parse_block(llm, text: str) -> Tuple[List[Dict], List[str]]:
+    """Parse text via Llama model."""
+    system_prompt = "You are a parser specializing in environmental reports. Return only valid JSON."
+    
+    user_prompt = f"""Parse this environmental report text into structured data. Extract:
 1. Facility Name
 2. Address (must include street number, street name, city, state, zip)
 3. Type of contamination/environmental issue
@@ -104,84 +129,120 @@ Text to parse:
 
 Return JSON in this format:
 {{
-   "records": [
-       {{
-           "name": "facility name",
-           "address": "full address",
-           "type": "contamination type",
-           "date": "date if present",
-           "description": "full description"
-       }}
-   ],
-   "unclassified_text": ["any text that couldn't be parsed into records"]
-}}"""
+    "records": [
+        {{
+            "name": "facility name",
+            "address": "full address",
+            "type": "contamination type",
+            "date": "date if present",
+            "description": "full description"
+        }}
+    ],
+    "unclassified_text": ["any text that couldn't be parsed into records"]
+}}
 
-   response = client.chat.completions.create(
-       model="gpt-4",
-       messages=[
-           {"role": "system", "content": "You are a parser specializing in environmental reports. Return only valid JSON."},
-           {"role": "user", "content": prompt}
-       ],
-       temperature=0
-   )
-   
-   try:
-       result = json.loads(response.choices[0].message.content)
-       return result["records"], result["unclassified_text"]
-   except:
-       return [], [text]
+Ensure you only return valid JSON."""
+
+    # Format prompt according to Llama 3's expected format
+    prompt = f"<|system|>\n{system_prompt}\n<|user|>\n{user_prompt}\n<|assistant|>"
+    
+    try:
+        print("Generating response...")
+        response = llm(prompt)[0]['generated_text']
+        
+        # Strip the prompt from the response to just get the assistant's reply
+        response = response.split("<|assistant|>")[-1].strip()
+        
+        # Extract JSON from response if it's embedded in text
+        json_match = re.search(r'```json\s*(.*?)\s*```', response, re.DOTALL)
+        if json_match:
+            response = json_match.group(1)
+        else:
+            # Try to find JSON without code blocks
+            json_match = re.search(r'(\{.*\})', response, re.DOTALL)
+            if json_match:
+                response = json_match.group(1)
+        
+        print("Parsing JSON response...")
+        result = json.loads(response)
+        return result["records"], result["unclassified_text"]
+    except Exception as e:
+        print(f"Error parsing response: {e}")
+        print(f"Raw response: {response}")
+        return [], [text]
 
 def process_mbox(mbox_path: str, output_csv: str, unclassified_txt: str, email_limit: int = float('inf')):
-   """Process .mbox file, writing results to CSV and excess text file."""
-   api_key = get_api_key()
-   client = OpenAI(api_key=api_key)
-   records = []
-   unclassified = []
-   
-   mbox = mailbox.mbox(mbox_path)
-   for i, message in enumerate(mbox):
-       if i >= email_limit:
-           break
-           
-       # email body
-       if message.is_multipart():
-           for part in message.walk():
-               if part.get_content_type() == 'text/plain':
-                   text = part.get_payload(decode=True).decode()
-                   break
-       else:
-           text = message.get_payload(decode=True).decode()
-       
-       # clean and parse
-       clean = clean_text(text)
-       parsed_records, unclassified_text = parse_block(client, clean)
-       
-       # geocoding lol
-       for record in parsed_records:
-           record["latlong"] = geocode_address(record["address"])
-       
-       records.extend(parsed_records)
-       unclassified.extend(unclassified_text)
-       
-       print(f"Processed email {i+1}/{min(email_limit, len(mbox))}")
-   
-   with open(output_csv, 'w', newline='', encoding='utf-8') as f:
-       writer = csv.DictWriter(f, fieldnames=['name', 'address', 'type', 'date', 'description', 'latlong'])
-       writer.writeheader()
-       writer.writerows(records)
-   
-   with open(unclassified_txt, 'w', encoding='utf-8') as f:
-       for text in unclassified:
-           f.write(text + '\n\n' + '-'*80 + '\n\n')
+    """Process .mbox file, writing results to CSV and excess text file."""
+    print("Initializing Llama model...")
+    llm = init_llama_model()
+    records = []
+    unclassified = []
+    
+    print(f"Opening mbox file: {mbox_path}")
+    mbox = mailbox.mbox(mbox_path)
+    for i, message in enumerate(mbox):
+        if i >= email_limit:
+            break
+            
+        print(f"Processing email {i+1}/{min(email_limit, len(mbox))}")
+        
+        # email body
+        if message.is_multipart():
+            for part in message.walk():
+                if part.get_content_type() == 'text/plain':
+                    text = part.get_payload(decode=True).decode(errors='replace')
+                    break
+            else:
+                text = ""  # no text/plain part found
+        else:
+            text = message.get_payload(decode=True).decode(errors='replace')
+        
+        if not text:
+            print("  No text content found, skipping")
+            continue
+            
+        print("  Cleaning text...")
+        clean = clean_text(text)
+        
+        print("  Parsing with Llama...")
+        parsed_records, unclassified_text = parse_block(llm, clean)
+        
+        print("  Geocoding addresses...")
+        for record in parsed_records:
+            record["latlong"] = geocode_address(record["address"])
+        
+        records.extend(parsed_records)
+        unclassified.extend(unclassified_text)
+        
+        print(f"  Found {len(parsed_records)} records")
+    
+    print(f"Writing {len(records)} records to {output_csv}")
+    with open(output_csv, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['name', 'address', 'type', 'date', 'description', 'latlong'])
+        writer.writeheader()
+        writer.writerows(records)
+    
+    print(f"Writing unclassified text to {unclassified_txt}")
+    with open(unclassified_txt, 'w', encoding='utf-8') as f:
+        for text in unclassified:
+            f.write(text + '\n\n' + '-'*80 + '\n\n')
+    
+    print("Processing complete!")
 
 if __name__ == '__main__':
-   parser = argparse.ArgumentParser(description='Process environmental report emails.')
-   parser.add_argument('mbox_file', help='Input mbox file')
-   parser.add_argument('output_csv', help='Output CSV file')
-   parser.add_argument('unclassified_txt', help='File for unclassified text')
-   parser.add_argument('--limit', type=int, default=float('inf'), 
-                     help='Maximum number of emails to process (default: no limit)')
-   
-   args = parser.parse_args()
-   
-   process_mbox(args.mbox_file, args.output_csv, args.unclassified_txt, args.limit)
+    parser = argparse.ArgumentParser(description='Process environmental report emails using Llama 3.1 70B.')
+    parser.add_argument('mbox_file', help='Input mbox file')
+    parser.add_argument('output_csv', help='Output CSV file')
+    parser.add_argument('unclassified_txt', help='File for unclassified text')
+    parser.add_argument('--limit', type=int, default=float('inf'), 
+                      help='Maximum number of emails to process (default: no limit)')
+    parser.add_argument('--gpus', default="0,1", 
+                      help='GPU devices to use (default: "0,1")')
+    
+    args = parser.parse_args()
+    
+    # set visible GPUs before importing torch
+    print(f"Setting CUDA_VISIBLE_DEVICES={args.gpus}")
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+    
+    process_mbox(args.mbox_file, args.output_csv, args.unclassified_txt, args.limit)
